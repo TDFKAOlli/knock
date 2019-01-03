@@ -3,6 +3,8 @@
  *
  *  Copyright (c) 2004-2019 by Judd Vinet <jvinet@zeroflux.org>
  *                             Sebastien Valat <sebastien.valat@gmail.com>
+ *                             Sasan Jalali <sasanj@arch.local>
+ *                             TDFKAOlli <TDFKAOlli@ish.de>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -35,6 +37,8 @@
 #include <resolv.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <ifaddrs.h>
 
 static char version[] = "0.8";
 
@@ -49,6 +53,7 @@ static char version[] = "0.8";
 void vprint(char *fmt, ...);
 void ver();
 void usage();
+bool bind_interface_addr(const char *if_name, int sd, int family);
 
 int o_verbose = 0;
 int o_udp     = 0;
@@ -64,6 +69,8 @@ int main(int argc, char** argv)
 	char ipname[256];
 	int result;
 	char * hostname;
+	bool do_bind = false;
+	char * ifname = NULL;
 	static struct option opts[] =
 	{
 		{"verbose",   no_argument,       0, 'v'},
@@ -73,10 +80,11 @@ int main(int argc, char** argv)
 		{"version",   no_argument,       0, 'V'},
 		{"ipv4",      no_argument,       0, '4'},
 		{"ipv6",      no_argument,       0, '6'},
+		{"interface", required_argument, 0, 'i'},
 		{0, 0, 0, 0}
 	};
 
-	while((opt = getopt_long(argc, argv, "vud:hV46", opts, &optidx))) {
+	while((opt = getopt_long(argc, argv, "vud:hV46i:", opts, &optidx))) {
 		if(opt < 0) {
 			break;
 		}
@@ -88,6 +96,7 @@ int main(int argc, char** argv)
 			case 'V': ver();
 			case '4': o_ip = IP_V4; break;
 			case '6': o_ip = IP_V6; break;
+			case 'i': ifname = optarg; do_bind = true; break;
 			case 'h': /* fallthrough */
 			default: usage();
 		}
@@ -154,6 +163,18 @@ int main(int argc, char** argv)
 		//extract ip as string (v4 or v6)
 		getnameinfo(infoptr->ai_addr, infoptr->ai_addrlen, ipname, sizeof(ipname), NULL, 0, NI_NUMERICHOST);
 
+		//bind socket to specific address if interface option was given
+		if (do_bind) {
+			if (o_ip == IP_DEFAULT) {
+				// No specific ip version forced. Set o_ip to family found for target
+				o_ip = infoptr->ai_family;
+			}
+			if (!bind_interface_addr(ifname, sd, o_ip)) {
+				fprintf(stderr,"error: interface %s not found.\n",ifname);
+				exit(1);
+			}
+		}
+
 		//connect or send UDP packet
 		if(o_udp || proto == PROTO_UDP) {
 			vprint("hitting udp %s:%s\n", ipname, port);
@@ -194,6 +215,7 @@ void usage() {
 	printf("  -d, --delay <t>      wait <t> milliseconds between port hits\n");
 	printf("  -4, --ipv4           Force usage of IPv4\n");
 	printf("  -6, --ipv6           Force usage of IPv6\n");
+	printf("  -i, --interface <n>  use interface <name> for port hits\n");
 	printf("  -v, --verbose        be verbose\n");
 	printf("  -V, --version        display version\n");
 	printf("  -h, --help           this help\n");
@@ -206,8 +228,49 @@ void usage() {
 void ver() {
 	printf("knock %s\n", version);
 	printf("Copyright (C) 2004-2019 Judd Vinet <jvinet@zeroflux.org>,"
-		" Sebastien Valat <sebastien.valat@gmail.com>\n");
+		" Sebastien Valat <sebastien.valat@gmail.com>,"
+		" Sasan Jalali <sasanj@arch.local>,"
+		" TDFKAOlli <TDFKAOlli@ish.de>\n");
 	exit(0);
+}
+
+bool bind_interface_addr(const char *if_name, int sd, int family) {
+	struct ifaddrs *addrs=NULL,*tmp=NULL;
+	bool found=false;
+	getifaddrs(&addrs);
+	tmp=addrs;
+	if(if_name == NULL) {
+		fprintf(stderr,"error: interface name is not set.\n");
+		exit(1);
+	}
+	vprint("Trying to bind for interface %s, family %d, socket descriptor %d\n", if_name, family, sd);
+	while(tmp) {
+		// check if ptr is valid and family match the configured one and interface name match
+		if (tmp->ifa_addr && 
+				tmp->ifa_addr->sa_family == family &&
+				strcmp(if_name,tmp->ifa_name) == 0 ) {
+			// try to bind socket
+			if(tmp->ifa_addr->sa_family == IP_V4) {
+				if(bind(sd, ((struct sockaddr *)(tmp->ifa_addr)), sizeof(struct sockaddr_in))<0) {
+					fprintf(stderr,"error: can not bind to specified IP_V4 interface %s.\n",if_name);
+					exit(1);
+				}
+			} else if (tmp->ifa_addr->sa_family == IP_V6) {
+				if(bind(sd, ((struct sockaddr *)(tmp->ifa_addr)), sizeof(struct sockaddr_in6))<0) {
+					fprintf(stderr,"error: can not bind to specified IP_V6 interface %s.\n",if_name);
+					exit(1);
+				}
+			} else {
+					fprintf(stderr,"error: address family %d shall be either AF_INET or AF_INET6.\n",family);
+					exit(1);
+			}
+			found=true;
+			break;
+		}
+		tmp = tmp->ifa_next;
+	}
+	freeifaddrs(addrs);
+	return found;
 }
 
 /* vim: set ts=2 sw=2 noet: */
