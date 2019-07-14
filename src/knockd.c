@@ -51,7 +51,6 @@
 #include <netinet/if_ether.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <ifaddrs.h>
@@ -128,7 +127,6 @@ void ver();
 void usage(int exit_code);
 char* strtoupper(char *str);
 char* trim(char *str);
-void runCommand(char *cmd);
 int parseconfig(char *configfile);
 int parse_port_sequence(char *sequence, opendoor_t *door);
 int get_new_one_time_sequence(opendoor_t *door);
@@ -147,6 +145,7 @@ int target_strcmp(char *ip, char *target);
 pcap_t *cap = NULL;
 FILE *logfd = NULL;
 int lltype = -1;
+int hasIpV4 = 0;
 int hasIpV6 = 0;
 /* list of IP addresses for given interface
  */
@@ -163,6 +162,7 @@ int  o_debug     = 0;
 int  o_daemon    = 0;
 int  o_lookup    = 0;
 int  o_skipIpV6  = 0;
+int  o_saveMem   = 0;
 char o_int[32]           = "";		/* default (eth0) is set after parseconfig() */
 char o_cfg[PATH_MAX]     = "/etc/knockd.conf";
 char o_pidfile[PATH_MAX] = "/var/run/knockd.pid";
@@ -187,11 +187,12 @@ int main(int argc, char **argv)
 		{"pidfile",   required_argument, 0, 'p'},
 		{"logfile",   required_argument, 0, 'g'},
 		{"only-ip-v4",no_argument,       0, '4'},
+		{"save-mem",  no_argument,       0, 's'},
 		{"version",   no_argument,       0, 'V'},
 		{0, 0, 0, 0}
 	};
 
-	while((opt = getopt_long(argc, argv, "4vDdli:c:p:g:hV", opts, &optidx))) {
+	while((opt = getopt_long(argc, argv, "4vDdli:c:p:g:hVs", opts, &optidx))) {
 		if(opt < 0) {
 			break;
 		}
@@ -202,6 +203,7 @@ int main(int argc, char **argv)
 			case 'd': o_daemon = 1; break;
 			case 'l': o_lookup = 1; break;
 			case '4': o_skipIpV6 = 1; break;
+			case 's': o_saveMem = 1; break;
 			case 'i': strncpy(o_int, optarg, sizeof(o_int)-1);
 								o_int[sizeof(o_int)-1] = '\0';
 								break;
@@ -279,6 +281,8 @@ int main(int argc, char **argv)
 				continue;
 
 			if((strcmp(ifa->ifa_name, o_int) == 0) && (ifa->ifa_addr->sa_family == AF_INET || (ifa->ifa_addr->sa_family == AF_INET6 && !o_skipIpV6))) {
+				if (ifa->ifa_addr->sa_family == AF_INET)
+					hasIpV4 = 1;
 				if (ifa->ifa_addr->sa_family == AF_INET6)
 					hasIpV6 = 1;
 				if((myip = calloc(1, sizeof(ip_literal_t))) == NULL) {
@@ -510,6 +514,7 @@ void usage(int exit_code) {
 	printf("  -g, --logfile          use an alternate logfile\n");
 	printf("  -v, --verbose          be verbose\n");
 	printf("  -4, --only-ip-v4       do not track ipv6\n");
+	printf("  -s, --save-mem         save memory by freeing permanent filter string buffers\n");
 	printf("  -V, --version          display version\n");
 	printf("  -h, --help             this help\n");
 	printf("\n");
@@ -792,6 +797,10 @@ int parseconfig(char *configfile)
 			fprintf(stderr, "error: section '%s' has an empty knock sequence\n", door->name);
 			return(1);
 		}
+		if(door->start_command == NULL && door->start_command6 == NULL) {
+			fprintf(stderr, "error: section '%s' has no start command\n", door->name);
+			return(1);
+		}
 	}
 
 	return(0);
@@ -953,6 +962,11 @@ void generate_pcap_filter()
 	 */
 	for (ipv6 = 0 ; ipv6 <=1 ; ipv6++)
 	{
+		if (ipv6 == 0 && !hasIpV4)
+			continue;
+		if (ipv6 == 1 && !hasIpV6)
+			continue;
+
 		if (ipv6 && o_skipIpV6)
 			continue;
 
@@ -1175,16 +1189,34 @@ void generate_pcap_filter()
 			door = (opendoor_t*)lp->data;
 			for (ipv6 = 0 ; ipv6 <= 1 ; ipv6++)
 			{
+				if (ipv6 == 0 && !hasIpV4)
+					continue;
+				if (ipv6 == 1 && !hasIpV6)
+					continue;
+
+				if (ipv6 && o_skipIpV6)
+					continue;
+
 				if (first)
 					first = 0;
 				else
 					bufsize = realloc_strcat(&buffer, " or ", bufsize);
-				if (ipv6 && o_skipIpV6)
-					continue;
-				if (ipv6)
+				if (ipv6) {
 					bufsize = realloc_strcat(&buffer, door->pcap_filter_expv6, bufsize);
-				else
+					if(o_saveMem == 1) {
+						// save memory and free door specific filter here directly
+						free(door->pcap_filter_expv6);
+						door->pcap_filter_expv6 = NULL;
+					}
+				}
+				else {
 					bufsize = realloc_strcat(&buffer, door->pcap_filter_exp, bufsize);
+					if(o_saveMem == 1) {
+						// save memory and free door specific filter here directly
+						free(door->pcap_filter_exp);
+						door->pcap_filter_exp = NULL;
+					}
+				}
 			}
 		}
 
@@ -1257,12 +1289,27 @@ void close_door(opendoor_t *door)
 	doors = list_remove(doors, door);
 	if(door) {
 		free(door->target);
-		free(door->start_command);
-		free(door->stop_command);
+		if(door->start_command) {
+			free(door->start_command);
+		}
+		if(door->start_command6) {
+			free(door->start_command6);
+		}
+		if(door->stop_command) {
+			free(door->stop_command);
+		}
+		if(door->stop_command6) {
+			free(door->stop_command6);
+		}
 		if (door->one_time_sequences_fd) {
 			fclose(door->one_time_sequences_fd);
 		}
-		free(door->pcap_filter_exp);
+		if(door->pcap_filter_exp) {
+			free(door->pcap_filter_exp);
+		}
+		if(door->pcap_filter_expv6) {
+			free(door->pcap_filter_expv6);
+		}
 		free(door);
 	}
 }
@@ -1271,8 +1318,7 @@ void close_door(opendoor_t *door)
  */
 char* get_ip(const char* iface, char *buf, int bufsize)
 {
-	int s;
-	struct ifreq ifr;
+	struct ifaddrs *addrs=NULL,*tmp=NULL;
 
 	if(bufsize <= 0) {
 		return(NULL);
@@ -1282,23 +1328,22 @@ char* get_ip(const char* iface, char *buf, int bufsize)
 	}
 	buf[0] = '\0';
 
-	s = socket(AF_INET, SOCK_DGRAM, 0);
-	if(s < 0) {
-		return(NULL);
+	getifaddrs(&addrs);
+	tmp=addrs;
+	while(tmp) {
+		if (tmp->ifa_addr && tmp->ifa_addr->sa_family == AF_INET) {
+			struct sockaddr_in *addr_in = (struct sockaddr_in *)tmp->ifa_addr;
+			if (strcmp(iface,tmp->ifa_name) == 0 ) {
+				strncpy(buf, inet_ntoa(addr_in->sin_addr), bufsize-1);
+				buf[bufsize-1] = '\0';
+				freeifaddrs(addrs);
+				return(buf);
+			}
+		}
+		tmp = tmp->ifa_next;
 	}
-
-	bzero((void*)(&ifr.ifr_name), sizeof(ifr.ifr_name));
-	strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name)-1);
-	ifr.ifr_name[sizeof(ifr.ifr_name)-1] = '\0';
-	if(ioctl(s, SIOCGIFADDR, &ifr)) {
-		close(s);
-		return(NULL);
-	}
-	close(s);
-
-	strncpy(buf, inet_ntoa((*(struct sockaddr_in *)&ifr.ifr_addr).sin_addr), bufsize-1);
-	buf[bufsize-1] = '\0';
-	return(buf);
+	freeifaddrs(addrs);
+	return(NULL);
 }
 
 /* Parse a command line, replacing tokens (eg, %IP%) with their real values and
@@ -1560,8 +1605,14 @@ void process_attempt(knocker_t *attempt)
 			get_new_one_time_sequence(attempt->door);
 
 			/* update pcap filter */
-			free(attempt->door->pcap_filter_exp);
-			attempt->door->pcap_filter_exp = NULL;
+			if(attempt->door->pcap_filter_expv6) {
+				free(attempt->door->pcap_filter_expv6);
+				attempt->door->pcap_filter_expv6 = NULL;
+			}
+			if(attempt->door->pcap_filter_exp) {
+				free(attempt->door->pcap_filter_exp);
+				attempt->door->pcap_filter_exp = NULL;
+			}
 			generate_pcap_filter();
 		}
 	}
